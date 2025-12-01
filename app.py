@@ -1,49 +1,75 @@
-from flask import Flask, request, jsonify, render_template
-import numpy as np
-import cv2
-import base64
-import re
+from flask import Flask, render_template, request
 import tensorflow as tf
+import tensorflow_datasets as tfds
+import numpy as np
+import os
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = "static/uploads"
 
-# Cargar modelo entrenado
-modelo = tf.keras.models.load_model("model.h5")
+# ----------------------------------------
+# ENTRENAR MODELO SI NO EXISTE
+# ----------------------------------------
+if not os.path.exists("model.h5"):
+    print("Entrenando modelo, espera...")
+    (ds_train, ds_test), info = tfds.load(
+        "mnist", split=["train", "test"], as_supervised=True, with_info=True
+    )
 
-# Página principal
-@app.route("/")
+    def preprocessing(img, label):
+        img = tf.image.resize(img, (128, 128))
+        img = tf.cast(img, tf.float32) / 255.0
+        return img, label
+
+    train_ds = ds_train.map(preprocessing).shuffle(10000).batch(32)
+    test_ds = ds_test.map(preprocessing).batch(32)
+
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.Conv2D(16, (3,3), activation='relu', input_shape=(128,128,1)),
+        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Conv2D(32, (3,3), activation='relu'),
+        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
+        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(10, activation='softmax')
+    ])
+
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    model.fit(train_ds, epochs=3, validation_data=test_ds)
+    model.save("model.h5")
+    print("Modelo guardado como model.h5")
+
+# ----------------------------------------
+# CARGAR MODELO YA ENTRENADO
+# ----------------------------------------
+model = tf.keras.models.load_model("model.h5")
+
+# ----------------------------------------
+# Rutas de Flask
+# ----------------------------------------
+@app.route("/", methods=["GET", "POST"])
 def index():
-    return render_template("index.html")
+    prediction = None
+    img_path = None
+    if request.method == "POST":
+        file = request.files["image"]
+        filename = secure_filename(file.filename)
+        img_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        file.save(img_path)
 
-# Endpoint para predicción del canvas
-@app.route("/predict_canvas", methods=["POST"])
-def predict_canvas():
-    data = request.get_json()
+        # Procesar imagen
+        img = tf.keras.preprocessing.image.load_img(img_path, color_mode="grayscale", target_size=(128,128))
+        img = tf.keras.preprocessing.image.img_to_array(img)
+        img = img / 255.0
+        img = np.expand_dims(img, axis=0)
 
-    if "image" not in data:
-        return jsonify({"error": "No se envió la imagen"}), 400
+        pred = model.predict(img)
+        prediction = int(np.argmax(pred))
 
-    # Convertir base64 a imagen
-    image_data = re.sub('^data:image/.+;base64,', '', data["image"])
-    img_bytes = base64.b64decode(image_data)
-
-    # Convertir a numpy array
-    img_array = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-
-    # Preprocesamiento tipo MNIST
-    img = cv2.resize(img, (28, 28))
-    img = 255 - img
-    img = img.astype("float32") / 255.0
-    img = img.reshape(1, 28, 28, 1)
-
-    # Predicción
-    pred = modelo.predict(img)
-    num = int(np.argmax(pred))
-    confianza = float(np.max(pred))
-
-    return jsonify({"prediccion": num, "confianza": confianza})
-
+    return render_template("index.html", prediction=prediction, img_path=img_path)
 
 if __name__ == "__main__":
     app.run(debug=True)
